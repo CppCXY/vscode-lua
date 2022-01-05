@@ -20,14 +20,22 @@ import {
     ServerOptions,
     DocumentSelector,
 } from 'vscode-languageclient/node';
+import { ConfigWatcher, IConfigUpdate } from "./ConfigWatcher";
 
+let moduleConfigWatcher: ConfigWatcher;
 let defaultClient: LuaClient;
 let clients: Map<string, LuaClient> = new Map();
 
-type HintResult = {
+interface HintResult {
     text: string,
-    pos:  types.Position,
+    pos: types.Position,
     kind: types.integer,
+}
+
+interface LuaModule extends vscode.QuickPickItem {
+    moduleName: string;
+    path: string;
+    name: string;
 }
 
 function registerCustomCommands(context: ExtensionContext) {
@@ -55,6 +63,20 @@ function registerCustomCommands(context: ExtensionContext) {
             }
         }
     }))
+}
+
+function registerConfigWatcher(context: ExtensionContext) {
+    moduleConfigWatcher = new ConfigWatcher('**/lua.module.json');
+
+    moduleConfigWatcher.onConfigUpdate(onModuleConfigUpdate);
+
+    context.subscriptions.push(moduleConfigWatcher);
+}
+
+function onModuleConfigUpdate(e: IConfigUpdate) {
+    if (defaultClient) {
+        defaultClient.sendRequest('config/moduleconfig/update', e);
+    }
 }
 
 let _sortedWorkspaceFolders: string[] | undefined;
@@ -91,15 +113,12 @@ function getOuterMostWorkspaceFolder(folder: WorkspaceFolder): WorkspaceFolder {
 }
 
 class LuaClient {
-    private context: ExtensionContext;
-    private documentSelector: DocumentSelector;
     protected client: LanguageClient;
-    constructor(context: ExtensionContext, documentSelector: DocumentSelector) {
-        this.context = context;
-        this.documentSelector = documentSelector;
+    constructor(private context: ExtensionContext,
+                private documentSelector: DocumentSelector) {
     }
 
-   async start() {
+    async start() {
         // Options to control the language client
         let clientOptions: LanguageClientOptions = {
             // Register the server for plain text documents
@@ -110,6 +129,9 @@ class LuaClient {
             },
             initializationOptions: {
                 changeConfiguration: true,
+            },
+            middleware: {
+                executeCommand: this.onServerCommand
             }
         };
 
@@ -172,11 +194,47 @@ class LuaClient {
         onDecorations(this.client);
         //onInlayHint(client);
         statusBar(this.client);
-   }
+    }
    
-   async stop() {
+    async stop() {
        this.client.stop()
-   }
+    }
+    
+    sendRequest(protocol: string, e: any) {
+        this.client.sendRequest(protocol, e);
+    }
+
+    async onServerCommand(command, args, next) {
+        if (command === "lua.quickfix.module") {
+            const modules: any[] = args.slice(2);
+            const selectList: LuaModule[] = modules.map(e => {
+                return {
+                    moduleName: e.moduleName,
+                    path: e.path,
+                    name: e.name,
+                    label: `import from ${e.moduleName}`,
+                    description: `${e.path}`
+                }
+            });
+            if (selectList.length === 1) {
+                const selected = selectList[0];
+                return next(command, [args[0], args[1], selected.moduleName, selected.name]);
+            }
+            else {
+                const selected = await vscode.window.showQuickPick(selectList, {
+                    matchOnDescription: true,
+                    matchOnDetail: true,
+                    placeHolder: "select module import"
+                });
+                if (selected) {
+                    return next(command, [args[0], args[1], selected.moduleName, selected.name]);
+                }
+            }
+        }
+        else {
+            next(command, args);
+        }
+    }
 }
 
 let barCount = 0;
@@ -336,6 +394,8 @@ function onInlayHint(client: LanguageClient) {
 
 export function activate(context: ExtensionContext) {
     registerCustomCommands(context);
+    registerConfigWatcher(context);
+
     function didOpenTextDocument(document: TextDocument) {
         // We are only interested in language mode text
         if (document.languageId !== 'lua' || (document.uri.scheme !== 'file' && document.uri.scheme !== 'untitled')) {
